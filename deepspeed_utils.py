@@ -1,11 +1,13 @@
 # Based on https://github.com/microsoft/DeepSpeedExamples/tree/master/inference/huggingface/text-generation
 
+import argparse
 import gc
 import io
 import json
 import math
 import os
 from pathlib import Path
+from typing import List
 
 import deepspeed
 import torch
@@ -120,7 +122,10 @@ class DSPipeline:
         return outputs
 
 
-def init_model(args, world_size, local_rank):
+def init_model(
+    args: argparse.Namespace, world_size: int, local_rank: int
+) -> DSPipeline:
+    """Initialize the deepspeed model"""
     data_type = getattr(torch, args.dtype)
 
     if local_rank == 0:
@@ -157,11 +162,14 @@ def init_model(args, world_size, local_rank):
     return pipe
 
 
-def generate(input_sentences, pipe, batch_size, **kwargs):
+def generate(
+    input_sentences: List[str], pipe: DSPipeline, batch_size: int, **generate_kwargs
+) -> List[str]:
+    """Generate predictions using a DSPipeline"""
     if batch_size > len(input_sentences):
         # dynamically extend to support larger bs by repetition
         input_sentences *= math.ceil(batch_size / len(input_sentences))
 
     inputs = input_sentences[:batch_size]
-    outputs = pipe(inputs, **kwargs)
+    outputs = pipe(inputs, **generate_kwargs)
     return outputs

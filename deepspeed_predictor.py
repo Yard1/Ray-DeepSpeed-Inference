@@ -1,8 +1,10 @@
+import argparse
 import os
 import socket
 from collections import defaultdict
 from contextlib import closing
 from datetime import timedelta
+from typing import List, Tuple
 
 import pandas as pd
 import ray
@@ -17,7 +19,7 @@ from deepspeed_utils import generate, init_model
 from huggingface_utils import reshard_checkpoint
 
 
-def find_free_port():
+def find_free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("", 0))
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -26,22 +28,28 @@ def find_free_port():
 
 @ray.remote
 class PredictionWorker:
-    def __init__(self, args, rank, world_size):
+    def __init__(self, args: argparse.Namespace, rank: int, world_size: int):
         self.args = args
         self.rank = rank
         self.world_size = world_size
 
-    def get_address_and_port(self):
+    def get_address_and_port(self) -> Tuple[str, int]:
         """Returns the IP address and a free port on this node."""
         addr = ray.util.get_node_ip_address()
         port = find_free_port()
 
         return addr, port
 
-    def init_distributed(self, local_rank, local_world_size, master_addr, master_port):
+    def init_distributed(
+        self, local_rank: int, local_world_size: int, master_addr: str, master_port: str
+    ):
+        """Initialize torch distributed backend"""
         os.environ["MASTER_ADDR"] = str(master_addr)
         os.environ["MASTER_PORT"] = str(master_port)
+        # Same as in Ray Train
         os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        # This is not really robust, as multiple worker groups on
+        # one node will overlap.
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
             [str(x) for x in range(local_world_size)]
         )
@@ -65,6 +73,7 @@ class PredictionWorker:
         os.environ["WORLD_SIZE"] = str(self.world_size)
 
     def init_model(self):
+        """Initialize model for inference"""
         if self.args.reshard_checkpoint_path:
             self.args.checkpoint_path = reshard_checkpoint(
                 self.args.checkpoint_path or self.args.name,
@@ -73,7 +82,7 @@ class PredictionWorker:
             )
         self.generator = init_model(self.args, self.world_size, self.local_rank)
 
-    def generate(self, data, column, **kwargs):
+    def generate(self, data: pd.DataFrame, column: str, **kwargs) -> List[str]:
         return generate(
             list(data[column]), self.generator, self.args.batch_size, **kwargs
         )
@@ -86,6 +95,16 @@ class DeepSpeedPredictor(Predictor):
         self.init_worker_group(scaling_config)
 
     def init_worker_group(self, scaling_config: ScalingConfig):
+        """Create the worker group.
+
+        Each worker in the group communicates with other workers through the
+        torch distributed backend. The worker group is inelastic (a failure of
+        one worker will destroy the entire group). Each worker in the group
+        recieves the same input data and outputs the same generated text.
+        """
+        args = self.checkpoint.to_dict()["args"]
+
+        # Start a placement group for the workers.
         self.pg = scaling_config.as_placement_group_factory().to_placement_group()
         prediction_worker_cls = PredictionWorker.options(
             num_cpus=scaling_config.num_cpus_per_worker,
@@ -95,22 +114,29 @@ class DeepSpeedPredictor(Predictor):
                 placement_group=self.pg, placement_group_capture_child_tasks=True
             ),
         )
-        args = self.checkpoint.to_dict()["args"]
+        # Create the prediction workers.
         self.prediction_workers = [
             prediction_worker_cls.remote(args, i, scaling_config.num_workers)
             for i in range(scaling_config.num_workers)
         ]
+        # Get the IPs and ports of the workers.
         self.prediction_workers_ips_ports = ray.get(
             [
                 prediction_worker.get_address_and_port.remote()
                 for prediction_worker in self.prediction_workers
             ]
         )
+        # Rank 0 worker will be set as the master address for torch distributed.
         rank_0_ip, rank_0_port = self.prediction_workers_ips_ports[0]
-        ip_dict = defaultdict(list)  # map from node ip to the workers on it
+
+        # Map from node ip to the workers on it
+        ip_dict = defaultdict(list)
         for i, ip_port in enumerate(self.prediction_workers_ips_ports):
             ip_dict[ip_port[0]].append(i)
 
+        # Configure local ranks and start the distributed backend on each worker.
+        # This assumes that there cannot be a situation where 2 worker groups use the
+        # same node.
         tasks = []
         for rank in range(len(self.prediction_workers)):
             worker = self.prediction_workers[rank]
@@ -121,20 +147,27 @@ class DeepSpeedPredictor(Predictor):
                     local_rank, local_world_size, rank_0_ip, rank_0_port
                 )
             )
-
         ray.get(tasks)
+
+        # Initialize the model itself on each worker.
         ray.get([worker.init_model.remote() for worker in self.prediction_workers])
 
-    def _predict_pandas(self, data: "pd.DataFrame", **kwargs) -> "pd.DataFrame":
+    def _predict_pandas(
+        self,
+        data: pd.DataFrame,
+        input_column: str = "predict",
+        output_column: str = "output",
+        **kwargs
+    ) -> pd.DataFrame:
         data_ref = ray.put(data)
         prediction = ray.get(
             [
-                worker.generate.remote(data_ref, column="predict", **kwargs)
+                worker.generate.remote(data_ref, column=input_column, **kwargs)
                 for worker in self.prediction_workers
             ]
         )[0]
 
-        return pd.DataFrame(prediction, columns=["output"])
+        return pd.DataFrame(prediction, columns=[output_column])
 
     @classmethod
     def from_checkpoint(cls, checkpoint: Checkpoint, **kwargs) -> "Predictor":

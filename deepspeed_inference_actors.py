@@ -11,7 +11,7 @@ from ray.train.batch_predictor import BatchPredictor
 from deepspeed_predictor import DeepSpeedPredictor
 
 
-def get_parser():
+def get_parser() -> ArgumentParser:
     parser = ArgumentParser()
 
     parser.add_argument("--name", required=True, type=str, help="model_name")
@@ -125,6 +125,7 @@ ds = (
 )
 
 # %%
+# This is a scaling config for one worker group.
 group_scaling_config = ScalingConfig(
     use_gpu=True,
     num_workers=args.num_gpus_per_worker_group,
@@ -143,6 +144,7 @@ pred = batch_predictor.predict(
     num_cpus_per_worker=0,
     min_scoring_workers=args.num_worker_groups,
     max_scoring_workers=args.num_worker_groups,
+    # Kwargs passed to mode.generate
     do_sample=True,
     temperature=0.9,
     max_length=100,
