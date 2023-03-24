@@ -15,13 +15,13 @@ def force_on_node(node_id: str, remote_func_or_actor_class):
     return remote_func_or_actor_class.options(**options)
 
 
-def run_on_every_node(remote_func_or_actor_class, **remote_kwargs):
+def run_on_every_node(remote_func_or_actor_class, *remote_args, **remote_kwargs):
     refs = []
     for node in ray.nodes():
         if node["Alive"] and node["Resources"].get("GPU", None):
             refs.append(
                 force_on_node(node["NodeID"], remote_func_or_actor_class).remote(
-                    **remote_kwargs
+                    *remote_args, **remote_kwargs
                 )
             )
     return ray.get(refs)
